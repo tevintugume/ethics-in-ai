@@ -1,0 +1,169 @@
+import customtkinter as ctk
+import pandas as pd
+import numpy as np
+from tkinter import messagebox
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from fairlearn.reductions import GridSearch, DemographicParity
+from fairlearn.metrics import MetricFrame, selection_rate
+
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
+EXCEL_FILE = "youth_soccer_players.xlsx"
+
+class FairRankingApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Fair Soccer Player Ranking with Fairlearn Model")
+        self.geometry("950x750")
+
+        try:
+            self.df = pd.read_excel(EXCEL_FILE)
+        except FileNotFoundError:
+            messagebox.showerror("File Error", f"Could not find {EXCEL_FILE}. Please place the file in this folder.")
+            self.destroy()
+            return
+
+        self.weights = {
+            "Speed (0-100 scale)": 0.20,
+            "Technique (0-100 scale)": 0.25,
+            "Height (cm)": 0,
+            "Stamina (0-100 scale)": 0.15,
+            "Mental Strength (0-100 scale)": 0.15,
+            "Education Grade (0-100 scale)": 0.05,
+            "Sports IQ (0-100 scale)": 0.10,
+            "Attitude Towards Authority (0-100 scale)": 0.05,
+            "Training Drive (0-100 scale)": 0.05,
+        }
+
+        self.feature_cols = list(self.weights.keys())
+
+        self.create_widgets()
+        self.prepare_data()
+        self.update_model_and_ranking()
+
+    def create_widgets(self):
+        header = ctk.CTkLabel(self, text="Adjust Weights & See Fair Player Ranking", font=("Arial", 18, "bold"))
+        header.pack(pady=10)
+
+        sliders_frame = ctk.CTkFrame(self)
+        sliders_frame.pack(pady=10, fill="x", padx=20)
+
+        self.sliders = {}
+        for i, (key, val) in enumerate(self.weights.items()):
+            label = ctk.CTkLabel(sliders_frame, text=f"{key} Weight:", width=250, anchor="w")
+            label.grid(row=i, column=0, padx=10, pady=5, sticky="w")
+            slider = ctk.CTkSlider(sliders_frame, from_=0, to=1, number_of_steps=100, command=self.slider_changed)
+            slider.set(val)
+            slider.grid(row=i, column=1, padx=10, pady=5, sticky="ew")
+            self.sliders[key] = slider
+        sliders_frame.grid_columnconfigure(1, weight=1)
+
+        self.train_button = ctk.CTkButton(self, text="Train Fair Model & Update Ranking", command=self.update_model_and_ranking)
+        self.train_button.pack(pady=10)
+
+        self.textbox = ctk.CTkTextbox(self, width=900, height=400)
+        self.textbox.pack(pady=10, padx=20)
+
+        self.bias_label = ctk.CTkLabel(self, text="", font=("Arial", 12), justify="left")
+        self.bias_label.pack(pady=10)
+
+    def slider_changed(self, value):
+        total = sum(slider.get() for slider in self.sliders.values())
+        if total == 0:
+            return
+        for key, slider in self.sliders.items():
+            self.weights[key] = slider.get() / total
+
+    def prepare_data(self):
+        df = self.df.copy()
+
+        bins = [0, 12, 15, 18, 100]
+        labels = ["<=12", "13-15", "16-18", "19+"]
+        df["Age_Group"] = pd.cut(df["Age"], bins=bins, labels=labels, right=False)
+
+        def compute_raw_score(row):
+            s = 0
+            for feat, w in self.weights.items():
+                s += row[feat] * w
+            return s
+
+        df["Raw_Potential_Score"] = df.apply(compute_raw_score, axis=1)
+        self.df = df
+
+    def update_model_and_ranking(self):
+        self.prepare_data()
+
+        df = self.df.copy()
+
+        X = df[self.feature_cols]
+        y = df["Raw_Potential_Score"]
+        A = df["Gender"]
+
+        X_train, X_test, y_train, y_test, A_train, A_test = train_test_split(
+            X, y, A, test_size=0.3, random_state=42)
+
+        threshold = np.percentile(y_train, 75)
+        y_train_bin = (y_train > threshold).astype(int)
+        y_test_bin = (y_test > threshold).astype(int)
+
+        base_estimator = RandomForestRegressor(random_state=42)
+        mitigator = GridSearch(
+            estimator=base_estimator,
+            constraints=DemographicParity(),
+            grid_size=20,
+        )
+        mitigator.fit(X_train, y_train_bin, sensitive_features=A_train)
+
+        fair_preds = mitigator.predict(X)
+
+        min_p = fair_preds.min()
+        max_p = fair_preds.max()
+        prodigy_chance = 100 * (fair_preds - min_p) / (max_p - min_p)
+        df["Prodigy_Chance_"] = prodigy_chance
+
+        df_sorted = df.sort_values("Prodigy_Chance_", ascending=False)
+
+        lines = [f"{'Rank':<5} {'Name':<20} {'Gender':<8} {'Age':<4} {'Prodigy Chance (%)':>18}"]
+        lines.append("-" * 65)
+        for i, row in enumerate(df_sorted.itertuples(), 1):
+            lines.append(f"{i:<5} {row.Name[:18]:<20} {row.Gender:<8} {row.Age:<4} {row.Prodigy_Chance_:>17.2f}%")
+
+        self.textbox.delete("0.0", "end")
+        self.textbox.insert("0.0", "\n".join(lines))
+
+        mf = MetricFrame(
+            metrics={"selection_rate": selection_rate},
+            y_true=(y > threshold).astype(int),
+            y_pred=(fair_preds > threshold),
+            sensitive_features=A,
+        )
+        bias_text = "Fairness Metric (Selection Rate) by Gender:\n"
+        for g, val in mf.by_group.items():
+            if hasattr(val, 'iloc'):
+                val = val.iloc[0]
+            bias_text += f"  {g}: {val:.3f}\n"
+
+        mf_intersection = MetricFrame(
+            metrics={"selection_rate": selection_rate},
+            y_true=(y > threshold).astype(int),
+            y_pred=(fair_preds > threshold),
+            sensitive_features=pd.DataFrame({"Gender": df["Gender"], "Age_Group": df["Age_Group"]}),
+        )
+        bias_text += "\nSelection Rate by Gender + Age Group:\n"
+        for key, val in mf_intersection.by_group.items():
+            if hasattr(val, 'iloc'):
+                val = val.iloc[0]
+            if isinstance(key, tuple):
+                key_str = " & ".join(str(k) for k in key)
+            else:
+                key_str = str(key)
+            bias_text += f"  {key_str}: {val:.3f}\n"
+
+        self.bias_label.configure(text=bias_text)
+
+
+if __name__ == "__main__":
+    app = FairRankingApp()
+    app.mainloop()
